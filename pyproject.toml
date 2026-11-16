@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ozone-perf-profiler"
+version = "0.1.0"
+description = "Freon benchmark + metrics harness for Apache Ozone clusters managed by Cloudera Manager"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",    # summary.xlsx
+    "openpyxl>=3.1",  # the xlsx engine pandas writes with
+]
+
+[project.scripts]
+opp = "ozone_perf_profiler.cli:main"
+
+[tool.setuptools]
+packages = ["ozone_perf_profiler"]
