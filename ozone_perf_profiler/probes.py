@@ -68,6 +68,12 @@ export KRB5CCNAME=$1
 ozone admin om roles ${2:+-id "$2"}
 '''
 
+# Args: <ccache>.
+_SCM_ROLES = r'''
+export KRB5CCNAME=$1
+ozone admin scm roles
+'''
+
 # Readable and valid inside Ozone volume names (lowercase, digits, '-'), e.g. 2026-nov-11-20h15m03s.
 _RUN_NAME = "LC_ALL=C date +%Y-%b-%d-%Hh%Mm%Ss | tr '[:upper:]' '[:lower:]'"
 
@@ -193,9 +199,10 @@ def kinit(remote: Remote, host: str, keytab: str, principal: str) -> str:
     return " ".join(remote.run(host, _KINIT, KRB5CC, keytab, principal).split())
 
 
-# --- OM HA --------------------------------------------------------------------------------------------------------
+# --- OM and SCM HA ------------------------------------------------------------------------------------------------
 
-_OM_ROLE_LINE = re.compile(r"(\S+)\s*:\s*(LEADER|FOLLOWER|LISTENER)\s*\(([^)]+)\)")
+_OM_ROLE_LINE = re.compile(r"(\S+)\s*:\s*(LEADER|FOLLOWER|LISTENER)\s*\(([^)]+)\)")  # om1 : LEADER (host)
+_SCM_ROLE_LINE = re.compile(r"^\s*([^\s:]+):\d+:(LEADER|FOLLOWER|CANDIDATE|LISTENER)\b", re.M)  # host:port:LEADER:...
 
 
 def om_leader(remote: Remote, host: str, service_id: str | None) -> str | None:
@@ -205,3 +212,12 @@ def om_leader(remote: Remote, host: str, service_id: str | None) -> str | None:
 
 def parse_om_leader(out: str) -> str | None:
     return next((m.group(3) for m in _OM_ROLE_LINE.finditer(out) if m.group(2) == "LEADER"), None)
+
+
+def scm_leader(remote: Remote, host: str) -> str | None:
+    """Hostname of the SCM (Ratis) leader, or None when it can't be told."""
+    return parse_scm_leader(remote.run(host, _SCM_ROLES, KRB5CC, timeout=120))
+
+
+def parse_scm_leader(out: str) -> str | None:
+    return next((m.group(1) for m in _SCM_ROLE_LINE.finditer(out) if m.group(2) == "LEADER"), None)

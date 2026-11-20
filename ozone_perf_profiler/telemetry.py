@@ -65,6 +65,13 @@ CATALOG = (
     Metric("JVM CPU load, avg", "avg_over_time(jvm_metrics_cpu_jvm_load[$window])"),
     Metric("log errors", "increase(jvm_metrics_log_error[$window])"),
     Metric("log warnings", "increase(jvm_metrics_log_warn[$window])"),
+    # total time spent in TracingUtil methods during the run, all OMs, SCMs and DNs added up (calls x mean ns per call)
+    Metric("importAndCreateSpan total ms",
+           "sum(increase(tracing_util_import_and_create_span_time_num_ops[$window])"
+           " * avg_over_time(tracing_util_import_and_create_span_time_avg_time[$window])) / 1e6"),
+    Metric("W3C context extract total ms",
+           "sum(increase(tracing_util_w3c_trace_context_extract_time_num_ops[$window])"
+           " * avg_over_time(tracing_util_w3c_trace_context_extract_time_avg_time[$window])) / 1e6"),
 )
 
 
@@ -200,7 +207,7 @@ def collect(p: Prompter, d: Discovered, source: Source, results: list[FreonResul
     values = [v for v in values if v.metric not in dropped]  # partly collected metrics can't be compared
     d.run_dir.write_json("metrics/metrics.json", [asdict(v) for v in values])
     metrics = [m.name for m in source.metrics if m.name not in dropped]
-    _print(p, by_node(values, metrics, d.discovery.om_leader), [r.run for r in results])
+    _print(p, by_node(values, metrics, d.discovery.leaders), [r.run for r in results])
     p.ok(f"saved {d.run_dir.path}/metrics/metrics.json")
     return values
 
@@ -244,27 +251,32 @@ class ServiceBlock:
     nodes: list[NodeBlock]
 
 
-def by_node(values: list[Value], metrics: list[str], om_leader: str | None) -> list[ServiceBlock]:
-    """Values grouped by service, then node (the OM leader first), each node's metrics in catalog order."""
+LEADER_ROLES = {"OzoneManager": "om", "StorageContainerManager": "scm"}  # processname -> role with a Ratis leader
+
+
+def by_node(values: list[Value], metrics: list[str], leaders: dict[str, str]) -> list[ServiceBlock]:
+    """Values grouped by service, then node (the OM and SCM leaders first), each node's metrics in catalog order.
+    leaders: role short name (om, scm) -> leader host."""
     cells: dict[tuple[str, str], dict[str, dict[str, float]]] = {}
     for v in values:
         process, _, host = v.series.partition("@")
         cells.setdefault((process, host), {}).setdefault(v.metric, {})[v.run] = v.value
     order = list(SERVICES)
-    leader = short(om_leader) if om_leader else None
     blocks = []
     for process in sorted({proc for proc, _ in cells}, key=lambda x: (order.index(x) if x in order else len(order), x)):
+        leader = leaders.get(LEADER_ROLES.get(process, ""))
+        leader = short(leader) if leader else None
         hosts = sorted((h for proc, h in cells if proc == process), key=lambda h: (h != leader, h))
-        nodes = [NodeBlock(_node_title(process, host, leader),
+        nodes = [NodeBlock(_node_title(host, leader),
                            [(m, cells[(process, host)][m]) for m in metrics if m in cells[(process, host)]])
                  for host in hosts]
         blocks.append(ServiceBlock(SERVICES.get(process, process), nodes))
     return blocks
 
 
-def _node_title(process: str, host: str, om_leader: str | None) -> str:
-    if process == "OzoneManager" and om_leader:
-        return f"{host} ({'leader' if host == om_leader else 'follower'})"
+def _node_title(host: str, leader: str | None) -> str:
+    if leader:
+        return f"{host} ({'leader' if host == leader else 'follower'})"
     return host or "(all)"
 
 

@@ -47,10 +47,11 @@ class Args:
     grace: str | None = _opt("seconds to wait between runs (default 300)")
     warmup_keys: str = _opt("keys of an unreported warm-up run before run 1; 0 skips it", "10")
     cleanup: bool = _opt("delete the Freon volume after the last run", False)
-    # JFR capture
-    capture_jfr: bool = _opt("record JFR on the Ozone JVMs during the runs (otherwise asked)", False)
-    jfr_services: str | None = _opt("services to record, comma-separated: om,scm,dn,recon,s3g (default om,scm,dn)")
-    jfr_period: str | None = _opt("JFR recording period in seconds from the start of run 1 (default 600)")
+    # Profiling (one of JFR or async-profiler)
+    profiler: str | None = _opt("profile the Ozone JVMs during the runs: none, jfr or async-profiler (otherwise asked)")
+    profile_services: str | None = _opt("services to profile, comma-separated: om,scm,dn,recon,s3g (default om,scm,dn)")
+    profile_period: str | None = _opt("recording period in seconds from the start of run 1 (default 600 = 10 min)")
+    asprof_events: str | None = _opt("async-profiler events, passed to asprof -e (default cpu,alloc,lock,wall)")
     # Telemetry (Prometheus)
     prometheus_url: str | None = _opt("the Ozone Prometheus (default: the OZONE_PROMETHEUS role in CM)")
     # All phases

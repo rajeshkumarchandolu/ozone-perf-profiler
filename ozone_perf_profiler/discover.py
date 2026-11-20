@@ -39,6 +39,12 @@ class Discovery:
     security: Security
     kerberos: KerberosLogin | None
     om_leader: str | None
+    scm_leader: str | None
+
+    @property
+    def leaders(self) -> dict[str, str]:
+        """role short name -> leader host, for the services that have one."""
+        return {k: v for k, v in (("om", self.om_leader), ("scm", self.scm_leader)) if v}
 
 
 @dataclass
@@ -63,8 +69,11 @@ def run(p: Prompter, args: Args) -> Discovered:
         freon_host, version = _pick_freon_host(p, args, remote, topo)
         security = _security(p, remote, freon_host)
         kerberos = _kerberos(p, args, remote, freon_host) if security.kerberos else None
-        leader = _om_leader(p, remote, topo, freon_host, security)
-        found = Discovery(topo, jvms, freon_host, version, security, kerberos, leader)
+        om_leader = _leader(p, "OM", topo.of_type("OZONE_MANAGER"),
+                            lambda: probes.om_leader(remote, freon_host, security.om_service_id))
+        scm_leader = _leader(p, "SCM", topo.of_type("STORAGE_CONTAINER_MANAGER"),
+                             lambda: probes.scm_leader(remote, freon_host))
+        found = Discovery(topo, jvms, freon_host, version, security, kerberos, om_leader, scm_leader)
         _print_layout(p, found)
         if not p.confirm("\nSave this cluster layout?"):
             raise Abort("layout not confirmed")
@@ -277,19 +286,19 @@ def _kerberos(p: Prompter, args: Args, remote: Remote, host: str) -> KerberosLog
                     flag="--kerberos-principal", validate=lambda n: login(keytab, n))
 
 
-def _om_leader(p: Prompter, remote: Remote, topo: Topology, host: str, security: Security) -> str | None:
-    oms = topo.of_type("OZONE_MANAGER")
-    if len(oms) == 1:
-        return oms[0].host
+def _leader(p: Prompter, label: str, roles: list, ask_cluster: Callable[[], str | None]) -> str | None:
+    """The Ratis leader of OM or SCM: the only instance, else what `ozone admin <om|scm> roles` says."""
+    if len(roles) == 1:
+        return roles[0].host
     try:
-        leader = probes.om_leader(remote, host, security.om_service_id)
+        leader = ask_cluster()
     except RemoteError as e:
-        p.warn(f"cannot tell the OM leader: {e}")
+        p.warn(f"cannot tell the {label} leader: {e}")
         return None
     if leader:
-        p.ok(f"OM leader: {leader}")
+        p.ok(f"{label} leader: {leader}")
     else:
-        p.warn("'ozone admin om roles' named no leader")
+        p.warn(f"'ozone admin {label.lower()} roles' named no leader")
     return leader
 
 
@@ -298,7 +307,7 @@ def _om_leader(p: Prompter, remote: Remote, topo: Topology, host: str, security:
 def _print_layout(p: Prompter, d: Discovery) -> None:
     def marks(host: str, kind: str) -> str:
         notes = []
-        if kind == "om" and d.om_leader and short(d.om_leader) == short(host):
+        if kind in d.leaders and short(d.leaders[kind]) == short(host):
             notes.append("leader")
         if kind == "gateway" and host == d.freon_host:
             notes.append("freon")

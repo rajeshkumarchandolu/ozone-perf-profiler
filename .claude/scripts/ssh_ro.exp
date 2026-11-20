@@ -1,0 +1,12 @@
+#!/usr/bin/expect -f
+# usage: expect -f ssh_ro.exp <host> '<remote command>'   (password read from $SSHPW)
+set timeout 30
+set host [lindex $argv 0]
+set cmd [lindex $argv 1]
+if {![info exists env(SSHPW)]} { puts "SSHPW not set"; exit 2 }
+log_user 0
+spawn ssh -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no root@$host $cmd
+expect {
+  -re "(?i)password:" { send "$env(SSHPW)\r"; log_user 1; exp_continue }
+  eof
+}

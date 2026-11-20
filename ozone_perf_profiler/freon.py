@@ -75,6 +75,79 @@ ozone sh volume delete -r -y "/$2"
 '''
 
 
+# region agent log
+_DBG_LOG = "/Volumes/cloudera/ozone-perf-profiler/.cursor/debug-30d5c8.log"
+_TOP_START = r'''
+mkdir -p "$1" && cd "$1" || exit 3
+setsid nohup bash -c 'timeout 3h top -b -d 1 -c -w 512 | awk "/^top - /{n=0} n++<25 {print; fflush()}" > "$0/top.txt"' "$1" < /dev/null > /dev/null 2>&1 &
+echo $! > top.pid
+'''
+_TOP_STOP = r'''
+cd "$1" || exit 0
+kill -- -"$(cat top.pid)" 2> /dev/null; sleep 0.3
+for p in $(awk '$1 ~ /^[0-9]+$/ && $9+0 >= 50 {print $1}' top.txt | sort -u); do
+  printf '%s %s\n' "$p" "$(tr '\0' ' ' < /proc/$p/cmdline 2> /dev/null | sed -E 's/ -(cp|classpath) [^ ]+//' | cut -c1-300)"
+done
+exit 0
+'''
+
+
+def _dbg(hypothesis: str, location: str, message: str, data: dict[str, object]) -> None:
+    import json
+    import threading
+    lock = globals().setdefault("_DBG_LOCK", threading.Lock())
+    with lock, open(_DBG_LOG, "a") as f:
+        f.write(json.dumps({"sessionId": "30d5c8", "runId": data.get("run", "?"), "hypothesisId": hypothesis,
+                            "location": location, "message": message, "data": data,
+                            "timestamp": int(time.time() * 1000)}) + "\n")
+
+
+def _hostcpu_start(d: Discovered, name: str) -> list[str]:
+    from .remote import parallel
+    hosts = sorted(set(d.discovery.topology.hosts) | {d.discovery.freon_host})
+    remote_dir = f"{REMOTE_BASE}/{d.run_dir.name}/{name}-hostcpu"
+    res = parallel(lambda h: d.remote.run(h, _TOP_START, remote_dir, timeout=30), hosts)
+    started = [h for h, r in res.items() if not isinstance(r, Exception)]
+    _dbg("B", "freon.py:_hostcpu_start", "host CPU samplers started",
+         {"run": f"{d.run_dir.name}/{name}", "hosts": [short(h) for h in started],
+          "failed": {short(h): str(r)[:200] for h, r in res.items() if isinstance(r, Exception)}})
+    return started
+
+
+def _hostcpu_stop(d: Discovered, name: str, hosts: list[str]) -> None:
+    from .remote import parallel
+    remote_dir, run = f"{REMOTE_BASE}/{d.run_dir.name}/{name}-hostcpu", f"{d.run_dir.name}/{name}"
+
+    def stop(h: str) -> None:
+        cmdlines = dict(x.split(" ", 1) for x in d.remote.run(h, _TOP_STOP, remote_dir, timeout=60).splitlines()
+                        if " " in x)
+        local = d.run_dir.path / "hostcpu" / name / f"{short(h)}-top.txt"
+        d.remote.fetch(h, f"{remote_dir}/top.txt", local)
+        hot, peak = 0, (0.0, "")
+        for frame in local.read_text(errors="replace").split("top - ")[2:]:  # [1] averages since boot
+            lines = frame.splitlines()
+            idle = re.search(r"([\d.]+)\s*id", next((x for x in lines if x.startswith("%Cpu")), ""))
+            busy = 100 - float(idle[1]) if idle else 0.0
+            peak = max(peak, (busy, lines[0][:8]))
+            if busy < 30:
+                continue
+            hot += 1
+            procs = [x.split(None, 11) for x in lines if re.match(r"\s*\d+\s", x)]
+            _dbg("B", "freon.py:_hostcpu_stop", "host CPU above 30%",
+                 {"run": run, "host": short(h), "time": lines[0][:8], "busy%": round(busy, 1),
+                  "top": [{"pid": p[0], "user": p[1], "cpu%": p[8], "cmd": cmdlines.get(p[0], p[-1])[-220:]}
+                          for p in procs[:6] if len(p) > 11]})
+        _dbg("B", "freon.py:_hostcpu_stop", "host CPU summary",
+             {"run": run, "host": short(h), "peak_busy%": round(peak[0], 1), "peak_at": peak[1],
+              "seconds_above_30%": hot})
+
+    for h, r in parallel(stop, hosts).items():
+        if isinstance(r, Exception):
+            _dbg("B", "freon.py:_hostcpu_stop", "host CPU sampler failed",
+                 {"run": run, "host": short(h), "error": str(r)[:300]})
+# endregion
+
+
 @dataclass(frozen=True)
 class FreonSpec:
     threads: int
@@ -110,10 +183,14 @@ class Launch:
             return f"ssh -t {target} tmux attach -t {self.session}   (detach: Ctrl-b d)"
         return f"ssh {target} tail -f {remote_dir}/freon.log"
 
-    def stop(self, target: str) -> str:
+    def stop_script(self) -> str:
+        """The host-side command that stops this Freon (its tmux session, or setsid's whole process group)."""
         if self.launcher == "tmux":
-            return f"ssh {target} tmux kill-session -t {self.session}"
-        return f"ssh {target} 'kill -- -{self.pid}'"
+            return f"tmux kill-session -t {shlex.quote(self.session)}"
+        return f"kill -- -{self.pid}"
+
+    def stop(self, target: str) -> str:
+        return f"ssh {target} {shlex.quote(self.stop_script())}"
 
 
 @dataclass(frozen=True)
@@ -190,6 +267,9 @@ def execute(p: Prompter, d: Discovered, plan: Plan, index: int) -> FreonRun:
         _remote(lambda: probes.kinit(remote, host, kerberos.keytab, kerberos.principal), "kinit")
     remote_dir = f"{REMOTE_BASE}/{d.run_dir.name}/{name}"
     session = "opp-" + re.sub(r"[.:]", "-", f"{d.run_dir.name}-{name}")  # tmux names can't hold '.' or ':'
+    # region agent log
+    hostcpu = _hostcpu_start(d, name)
+    # endregion
     out = _remote(lambda: remote.run(host, _START, remote_dir, session, ccache, *spec.argv()),
                   "starting Freon")
     launch = Launch.parse(out, session)
@@ -203,9 +283,23 @@ def execute(p: Prompter, d: Discovered, plan: Plan, index: int) -> FreonRun:
     try:
         state = _follow(p, remote, host, remote_dir)
     except KeyboardInterrupt:
-        p.warn(f"Freon keeps running on {short(host)}. Stop it with: {launch.stop(target)}")
+        # region agent log
+        _hostcpu_stop(d, name, hostcpu)
+        # endregion
+        p.say()
+        if p.interactive and p.confirm(f"Stop Freon on {short(host)} now?", default=True):
+            try:
+                remote.run(host, launch.stop_script(), timeout=30)
+                p.ok(f"stopped Freon on {short(host)}")
+            except RemoteError as e:
+                p.warn(f"stopping Freon failed ({e}); stop it with: {launch.stop(target)}")
+        else:
+            p.warn(f"Freon keeps running on {short(host)}. Stop it with: {launch.stop(target)}")
         raise
     result = _collect(p, d, index, host, remote_dir, command, spec, launch)
+    # region agent log
+    _hostcpu_stop(d, name, hostcpu)
+    # endregion
     p.ok(f"Freon {'warm-up' if index == 0 else f'run {index}'} completed in {result.duration_s}s, "
          f"{_describe_exit(state)}")
     return result

@@ -22,3 +22,6 @@ venv/
 
 # Run output
 /.output/
+/analyze-overhead/
+/analyze-overhead.zip
+/.cursor/

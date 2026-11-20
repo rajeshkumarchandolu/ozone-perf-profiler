@@ -85,8 +85,37 @@ def report(p: Prompter, run_dir: RunDir, run: FreonRun) -> FreonResult:
     text = (run_dir.path / folder / "freon.log").read_text(errors="replace").replace("\r", "\n")
     result = parse(text, run)
     run_dir.write_json(f"{folder}/freon.json", {"ok": result.ok, **asdict(result)})
+    # region agent log
+    _dbg_phases(run_dir, run, text)
+    # endregion
     _print_status(p, result, text)
     return result
+
+
+# region agent log
+def _dbg_phases(run_dir: RunDir, run: FreonRun, text: str) -> None:
+    from datetime import datetime
+
+    from .freon import _dbg
+    stamped = [(datetime.strptime(m[1], "%y/%m/%d %H:%M:%S"), m[2])
+               for m in re.finditer(r"^(\d\d/\d\d/\d\d \d\d:\d\d:\d\d) (.*)$", text, re.M)]
+    prog = [(t, int(m[1])) for t, x in stamped if (m := re.search(r"\((\d+) out of \d+\)", x))]
+    if not stamped or not prog:
+        return
+    start = next((t for t, x in stamped if "Executing test" in x), stamped[0][0])
+    first = next((t for t, n in prog if n > 0), prog[-1][0])
+    done = next(t for t, n in prog if n == prog[-1][1])
+    rates = [(t, n - prog[i - 1][1]) for i, (t, n) in enumerate(prog) if i and first < t <= done]
+    med = sorted(r for _, r in rates)[len(rates) // 2] if rates else None
+    tracing = re.search(r"Initialized tracing service: freon \(enabled=(\w+)", text)
+    _dbg("A,C,D", "freon_output.py:_dbg_phases", "freon phases",
+         {"run": f"{run_dir.name}/{run_name(run.index)}", "tracing": tracing[1] if tracing else None,
+          "setup_s": (first - start).seconds, "writing_s": (done - first).seconds,
+          "shutdown_s": (stamped[-1][0] - done).seconds, "median_keys_per_s": med,
+          "slow_seconds": [(f"{t:%H:%M:%S}", r) for t, r in rates if med and r < 0.6 * med],
+          "channel_timeouts": re.findall(r"Timed out (?:gracefully|forcefully) shutting down.*?target=([\d.:]+)",
+                                         text)})
+# endregion
 
 
 def series(p: Prompter, run_dir: RunDir, results: list[FreonResult]) -> None:
