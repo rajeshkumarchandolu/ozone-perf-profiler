@@ -18,4 +18,4 @@ dependencies = [
 opp = "ozone_perf_profiler.cli:main"
 
 [tool.setuptools]
-packages = ["ozone_perf_profiler"]
+packages = ["cmclient", "ozone_perf_profiler", "usecases"]

@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import probes
+from . import duration, probes
 from .discover import Discovered
 from .options import Args
 from .prompts import Abort, Invalid, Ok, Option, Prompter
@@ -237,17 +237,18 @@ def ask(p: Prompter, args: Args, d: Discovered) -> Plan:
     p.section("Freon settings")
     spec, answers = _ask_spec(p, args, d)
     runs = p.ask("Number of runs", _positive("runs"), default="3", preset=args.runs, flag="--runs")
-    grace = p.ask("Grace period between runs (seconds)", _positive("grace", minimum=0), default="300",
+    grace = p.ask("Grace period between runs (e.g. 2m, 300s)", duration.check("grace period"), default="5m",
                   preset=args.grace, flag="--grace") if runs > 1 else 0
     cleanup = args.cleanup or p.confirm(f"Delete volume /{spec.volume} after the last run?", default=False)
-    answers |= {"runs": runs, "grace": grace if runs > 1 else None, "cleanup": cleanup}
+    answers |= {"runs": runs, "grace": duration.format(grace) if runs > 1 else None, "cleanup": cleanup}
     try:
         warmup = _positive("warm-up keys", minimum=0)(args.warmup_keys).value
     except Invalid as e:
         raise Abort(f"--warmup-keys: {e}") from None
     answers["warmup_keys"] = None if warmup == DEFAULT_WARMUP_KEYS else warmup
     plan = Plan(spec, runs, grace, cleanup, answers, warmup)
-    series = f"{runs} runs, {grace}s apart, buckets {spec.bucket}-run-1..{runs}" if runs > 1 else "1 run"
+    series = (f"{runs} runs, {duration.format(grace)} apart, buckets {spec.bucket}-run-1..{runs}" if runs > 1
+              else "1 run")
     if warmup:
         series = f"a {warmup}-key warm-up into {spec.bucket}-warmup, then {series}"
     p.say(f"\n  {series}, on {d.discovery.freon_host}; run 1:\n"
@@ -307,7 +308,7 @@ def execute(p: Prompter, d: Discovered, plan: Plan, index: int) -> FreonRun:
 
 def wait_grace(p: Prompter, plan: Plan, next_index: int) -> None:
     resume = time.strftime("%H:%M:%S", time.localtime(time.time() + plan.grace_s))
-    p.say(f"\n  grace period: run {next_index} starts in {plan.grace_s}s (at {resume})")
+    p.say(f"\n  grace period: run {next_index} starts in {duration.format(plan.grace_s)} (at {resume})")
     time.sleep(plan.grace_s)
 
 

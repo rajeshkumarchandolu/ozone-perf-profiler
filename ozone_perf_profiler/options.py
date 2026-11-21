@@ -25,7 +25,8 @@ class Args:
     """Every value is optional: what is missing is asked for. Secrets only via $CM_PWD / $SSH_PWD or a prompt."""
     # Cluster discovery
     cm_url: str | None = _opt("any Cloudera Manager URL, e.g. https://cm-host:7183/cmf/home")
-    cm_user: str | None = _opt("CM user (read access is enough)")
+    cm_user: str | None = _opt("CM user (read access is enough for opp; use cases that change config need "
+                               "write access)")
     cm_ca_cert: str | None = _opt("PEM CA bundle that signs the CM certificate")
     insecure: bool = _opt("skip TLS certificate verification", False)
     cluster: str | None = _opt("CM cluster name")
@@ -44,13 +45,13 @@ class Args:
     bucket: str | None = _opt("Ozone bucket (default freon)")
     freon_args: str | None = _opt("extra ockg arguments, appended as is, e.g. --freon-args='--om-service-id x'")
     runs: str | None = _opt("Freon runs in the series, each into its own bucket (default 3)")
-    grace: str | None = _opt("seconds to wait between runs (default 300)")
+    grace: str | None = _opt("wait between runs, e.g. 2m, 90s, or seconds (default 5m)")
     warmup_keys: str = _opt("keys of an unreported warm-up run before run 1; 0 skips it", "10")
     cleanup: bool = _opt("delete the Freon volume after the last run", False)
     # Profiling (one of JFR or async-profiler)
     profiler: str | None = _opt("profile the Ozone JVMs during the runs: none, jfr or async-profiler (otherwise asked)")
     profile_services: str | None = _opt("services to profile, comma-separated: om,scm,dn,recon,s3g (default om,scm,dn)")
-    profile_period: str | None = _opt("recording period in seconds from the start of run 1 (default 600 = 10 min)")
+    profile_period: str | None = _opt("recording period from the start of run 1, e.g. 10m, 600s (default 10m)")
     asprof_events: str | None = _opt("async-profiler events, passed to asprof -e (default cpu,alloc,lock,wall)")
     # Telemetry (Prometheus)
     prometheus_url: str | None = _opt("the Ozone Prometheus (default: the OZONE_PROMETHEUS role in CM)")

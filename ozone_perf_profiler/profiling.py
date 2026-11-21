@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from . import duration
 from .discover import Discovered
 from .freon import REMOTE_BASE
 from .options import Args
@@ -23,7 +24,7 @@ from .remote import RemoteError, parallel, short
 
 NONE, JFR, ASYNC = "none", "jfr", "async-profiler"
 DEFAULT_SERVICES = "om,scm,dn"
-DEFAULT_PERIOD_S = "600"  # 10 minutes
+DEFAULT_PERIOD = "10m"
 JFR_SETTINGS = "profile"  # the JDK's low-overhead profiling template
 ASPROF_VERSION = "4.6"
 ASPROF_HOME = f"/opt/async-profiler-{ASPROF_VERSION}"
@@ -275,12 +276,12 @@ def ask(p: Prompter, args: Args, d: Discovered, avail: Availability) -> ProfileP
         return None
     targets = p.ask("Services to record (om, scm, dn, recon, s3g)", _services(_targets(d, profiler)),
                     default=DEFAULT_SERVICES, preset=args.profile_services, flag="--profile-services")
-    period = p.ask("Recording period (seconds)", _period, default=DEFAULT_PERIOD_S, preset=args.profile_period,
+    period = p.ask("Recording period (e.g. 10m, 600s)", _period, default=DEFAULT_PERIOD, preset=args.profile_period,
                    flag="--profile-period")
     p.warn(f"{profiler} costs a few % of CPU: compare these runs only with other {profiler} runs")
     services = ",".join(dict.fromkeys(t.service for t in targets))
     answers = {"profiler": profiler, "profile_services": None if services == DEFAULT_SERVICES else services,
-               "profile_period": None if str(period) == DEFAULT_PERIOD_S else period,
+               "profile_period": None if period == duration.parse(DEFAULT_PERIOD) else duration.format(period),
                "asprof_events": None if profiler != ASYNC or events == DEFAULT_EVENTS else events}
     plan = ProfilePlan(profiler, tuple(targets), period, events, f"opp-{d.run_dir.name}", answers)
     return _ask_leftovers(p, d, plan)
@@ -380,9 +381,8 @@ def _services(available: list[Target]) -> Callable[[str], Ok[list[Target]]]:
 
 
 def _period(raw: str) -> Ok[int]:
-    if not raw.isdigit() or int(raw) < 30:
-        raise Invalid("a whole number of seconds, at least 30")
-    return Ok(int(raw), f"{int(raw) // 60}m{int(raw) % 60:02d}s from the start of run 1")
+    seconds = duration.check("recording period", minimum=30)(raw).value
+    return Ok(seconds, f"{duration.format(seconds)} from the start of run 1")
 
 
 # --- before Freon: install ----------------------------------------------------------------------------------------
@@ -430,8 +430,8 @@ def start(p: Prompter, d: Discovered, plan: ProfilePlan) -> list[Target]:
         p.fail(f"{plan.profiler} did not start on any JVM; the Freon runs go ahead without it")
         return started
     until = time.strftime("%H:%M:%S", time.localtime(time.time() + plan.period_s))
-    p.ok(f"{plan.profiler} recording on {len(started)}/{len(plan.targets)} JVMs for {plan.period_s}s "
-         f"(until {until} local)")
+    p.ok(f"{plan.profiler} recording on {len(started)}/{len(plan.targets)} JVMs for "
+         f"{duration.format(plan.period_s)} (until {until} local)")
     return started
 
 
@@ -479,4 +479,5 @@ def finish(p: Prompter, d: Discovered, plan: ProfilePlan, started: list[Target])
 
 def interrupted_hint(plan: ProfilePlan) -> str:
     folder = plan.targets[0].remote_file.rsplit("/", 1)[0]
-    return f"{plan.profiler} keeps recording for up to {plan.period_s}s; the files stay in {folder} on each host"
+    return (f"{plan.profiler} keeps recording for up to {duration.format(plan.period_s)}; "
+            f"the files stay in {folder} on each host")

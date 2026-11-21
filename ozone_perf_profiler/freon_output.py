@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
 
 from .freon import FreonRun, run_name
 from .manifest import RunDir
@@ -22,6 +23,8 @@ _FIELDS = {"count": "count", "mean rate": "mean_rate", "mean_rate": "mean_rate",
 _RATE_FIELDS = {"count", "mean_rate"}
 _CONSOLE_VALUE = re.compile(r"^\s+(.+?)\s*<?=\s*([-+0-9.eE]+)\s*(\S*)")
 _SLF4J_TIMER = re.compile(r"type=TIMER,\s*name=([^,]+),(.*)")
+_PROGRESS = re.compile(r"^(\d\d/\d\d/\d\d \d\d:\d\d:\d\d) .*Progress: ([\d.]+) %", re.M)
+_STAMP = "%y/%m/%d %H:%M:%S"
 _TOTALS = {
     "total_time_s": re.compile(r"Total execution time \(sec\):\s*(\d+)"),
     "failures": re.compile(r"Failures:\s*(\d+)"),
@@ -59,7 +62,8 @@ class FreonResult:
     start_epoch: int
     end_epoch: int
     exit_code: int | None
-    total_time_s: int | None
+    total_time_s: int | None   # Freon's 'Total execution time': includes the client's shutdown
+    write_s: int | None        # first 0% to first 100% progress line: the time spent writing the keys
     successes: int | None
     failures: int | None
     timers: dict[str, TimerStats] = field(default_factory=dict)
@@ -132,8 +136,18 @@ def series(p: Prompter, run_dir: RunDir, results: list[FreonResult]) -> None:
 def parse(text: str, run: FreonRun) -> FreonResult:
     totals = {k: _last_int(rx, text) for k, rx in _TOTALS.items()}
     return FreonResult(run=run_name(run.index), bucket=run.spec.bucket, start_epoch=run.start_epoch,
-                       end_epoch=run.end_epoch, exit_code=run.exit_code, **totals,
+                       end_epoch=run.end_epoch, exit_code=run.exit_code, write_s=write_seconds(text), **totals,
                        timers={**_console_timers(text), **_slf4j_timers(text)})
+
+
+def write_seconds(text: str) -> int | None:
+    """Seconds from Freon's first 0% to its first 100% progress line (1 s resolution)."""
+    marks = _PROGRESS.findall(text)
+    start = next((t for t, pct in marks if float(pct) == 0.0), None)
+    end = next((t for t, pct in marks if float(pct) == 100.0), None)
+    if not start or not end:
+        return None
+    return int((datetime.strptime(end, _STAMP) - datetime.strptime(start, _STAMP)).total_seconds())
 
 
 def _fmt(v: object, label: str = "") -> str:

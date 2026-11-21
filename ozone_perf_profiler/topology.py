@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .cm import CmCluster, CmService
+from cmclient.cm import CmCluster, CmService
 
 
 @dataclass(frozen=True)

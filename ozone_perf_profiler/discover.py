@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
-from . import cm, probes, topology
-from .cm import CmClient, CmCluster, CmError, CmService, CmTlsError
-from .httpclient import Tls
+from cmclient import cm
+from cmclient.cm import CmClient, CmCluster, CmError, CmService, CmTlsError
+from cmclient.http import Tls
+
+from . import probes, topology
 from .manifest import RunDir
 from .options import CM_PWD_ENV, SSH_PWD_ENV, Args
 from .probes import Jvm, Security

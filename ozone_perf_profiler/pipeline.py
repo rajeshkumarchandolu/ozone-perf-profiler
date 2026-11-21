@@ -7,7 +7,8 @@ from .options import CM_PWD_ENV, SSH_PWD_ENV, Args
 from .prompts import Abort, Prompter
 
 
-def run(args: Args) -> bool:
+def run(args: Args) -> list[freon_output.FreonResult]:
+    """Runs everything for one configuration; returns the measured runs' results (the warm-up is not included)."""
     p = Prompter(interactive=not args.yes)
     d = discover.run(p, args)
     with d.remote:
@@ -42,7 +43,7 @@ def run(args: Args) -> bool:
     report.write(p, d, plan, results, source, values, profile, recordings)
     p.say(f"\nRun folder: {d.run_dir.path}")
     p.say(f"Repeat without questions ({CM_PWD_ENV}/{SSH_PWD_ENV} from the environment):\n  {command}")
-    return all(r.ok for r in results)
+    return results
 
 
 def _interrupted_profiling(p: Prompter, d: discover.Discovered, profile: profiling.ProfilePlan,

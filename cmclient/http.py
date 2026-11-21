@@ -1,11 +1,13 @@
-"""Minimal HTTPS GET on urllib, shared by the CM and (later) Prometheus clients."""
+"""Minimal HTTPS client on urllib, shared by the CM and Prometheus clients."""
 
 from __future__ import annotations
 
+import json
 import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 TIMEOUT_S = 30
 
@@ -35,17 +37,29 @@ class Tls:
 
 
 def get(url: str, tls: Tls, headers: dict[str, str] | None = None, timeout: float = TIMEOUT_S) -> bytes:
-    """GET straight to the cluster host. Proxies from the environment or macOS settings are ignored: a corporate
-    proxy can't reach cluster hosts, and for plain http it answers itself (e.g. 400) instead of the server."""
-    request = urllib.request.Request(url, headers=headers or {}, method="GET")
+    return request("GET", url, tls, headers, timeout=timeout)
+
+
+def request(method: str, url: str, tls: Tls, headers: dict[str, str] | None = None, body: Any = None,
+            timeout: float = TIMEOUT_S) -> bytes:
+    """One HTTP call straight to the cluster host; body (if any) is sent as JSON.
+
+    Proxies from the environment or macOS settings are ignored: a corporate proxy can't reach cluster hosts, and for
+    plain http it answers itself (e.g. 400) instead of the server."""
+    headers = dict(headers or {})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                          urllib.request.HTTPSHandler(context=tls.context()))
     try:
-        with opener.open(request, timeout=timeout) as response:
+        with opener.open(req, timeout=timeout) as response:
             return response.read()
     except urllib.error.HTTPError as e:
-        body = " ".join(e.read(300).decode(errors="replace").split())
-        raise HttpError(f"HTTP {e.code} {e.reason}" + (f": {body}" if body else ""), e.code) from None
+        text = " ".join(e.read(300).decode(errors="replace").split())
+        raise HttpError(f"HTTP {e.code} {e.reason}" + (f": {text}" if text else ""), e.code) from None
     except urllib.error.URLError as e:
         if isinstance(e.reason, ssl.SSLCertVerificationError):
             raise TlsError(f"TLS certificate not trusted: {e.reason.verify_message}") from None

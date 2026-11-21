@@ -28,7 +28,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = Args(**vars(_parser().parse_args(argv)))
     try:
-        return 0 if pipeline.run(args) else 2
+        results = pipeline.run(args)
+        return 0 if results and all(r.ok for r in results) else 2
     except Abort as e:
         Prompter().fail(f"stopped: {e}")
         return 1

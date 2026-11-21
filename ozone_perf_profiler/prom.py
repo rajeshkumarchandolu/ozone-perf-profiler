@@ -7,8 +7,8 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
-from . import httpclient
-from .httpclient import HttpError, Tls
+from cmclient import http as httpclient
+from cmclient.http import HttpError, Tls
 
 
 class PromError(Exception):
