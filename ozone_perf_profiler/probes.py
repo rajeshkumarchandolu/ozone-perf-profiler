@@ -68,10 +68,34 @@ export KRB5CCNAME=$1
 ozone admin om roles ${2:+-id "$2"}
 '''
 
+# Args: <ccache> <om service id or empty> <node id of the new leader>.
+_OM_TRANSFER = r'''
+export KRB5CCNAME=$1
+ozone admin om transfer ${2:+-id "$2"} -n "$3"
+'''
+
 # Args: <ccache>.
 _SCM_ROLES = r'''
 export KRB5CCNAME=$1
 ozone admin scm roles
+'''
+
+# Args: <ccache> <SCM id (UUID) or node id of the new leader>.
+_SCM_TRANSFER = r'''
+export KRB5CCNAME=$1
+ozone admin scm transfer -n "$2"
+'''
+
+# Args: <ccache>.
+_DN_LIST = r'''
+export KRB5CCNAME=$1
+ozone admin datanode list
+'''
+
+# Args: <ccache> <datanode hostname>.
+_DN_DECOMMISSION = r'''
+export KRB5CCNAME=$1
+ozone admin datanode decommission "$2"
 '''
 
 # Readable and valid inside Ozone volume names (lowercase, digits, '-'), e.g. 2026-nov-11-20h15m03s.
@@ -214,6 +238,17 @@ def parse_om_leader(out: str) -> str | None:
     return next((m.group(3) for m in _OM_ROLE_LINE.finditer(out) if m.group(2) == "LEADER"), None)
 
 
+def om_roles(remote: Remote, host: str, service_id: str | None) -> list[tuple[str, str, str]]:
+    """(node id, LEADER/FOLLOWER/LISTENER, host) of every OM, from `ozone admin om roles`."""
+    out = remote.run(host, _OM_ROLES, KRB5CC, service_id or "", timeout=120)
+    return [(m.group(1), m.group(2), m.group(3)) for m in _OM_ROLE_LINE.finditer(out)]
+
+
+def om_transfer(remote: Remote, host: str, service_id: str | None, node_id: str) -> None:
+    """Asks the OMs to hand Ratis leadership to node_id; raises RemoteError if the command fails."""
+    remote.run(host, _OM_TRANSFER, KRB5CC, service_id or "", node_id, timeout=180)
+
+
 def scm_leader(remote: Remote, host: str) -> str | None:
     """Hostname of the SCM (Ratis) leader, or None when it can't be told."""
     return parse_scm_leader(remote.run(host, _SCM_ROLES, KRB5CC, timeout=120))
@@ -221,3 +256,38 @@ def scm_leader(remote: Remote, host: str) -> str | None:
 
 def parse_scm_leader(out: str) -> str | None:
     return next((m.group(1) for m in _SCM_ROLE_LINE.finditer(out) if m.group(2) == "LEADER"), None)
+
+
+# host:port:ROLE:<raft peer id = SCM id>:address
+_SCM_ROLE_PEER = re.compile(r"^\s*([^\s:]+):\d+:(LEADER|FOLLOWER|CANDIDATE|LISTENER):([^:\s]+)", re.M)
+
+
+def scm_roles(remote: Remote, host: str) -> list[tuple[str, str, str]]:
+    """(SCM id, LEADER/FOLLOWER/..., host) of every SCM, from `ozone admin scm roles`."""
+    out = remote.run(host, _SCM_ROLES, KRB5CC, timeout=120)
+    return [(m.group(3), m.group(2), m.group(1)) for m in _SCM_ROLE_PEER.finditer(out)]
+
+
+def scm_transfer(remote: Remote, host: str, scm_id: str) -> None:
+    """Asks the SCMs to hand Ratis leadership to scm_id; raises RemoteError if the command fails."""
+    remote.run(host, _SCM_TRANSFER, KRB5CC, scm_id, timeout=180)
+
+
+# --- datanodes ----------------------------------------------------------------------------------------------------
+
+_DN_BLOCK = re.compile(r"^Datanode: \S+ \((?:[^/)]*/)*?[^/)]*/([^/)]+)/\d+ pipelines\)\s*\nOperational State: (\S+)"
+                       r"(?:\s*\nHealth State: (\S+))?", re.M)
+
+
+def datanode_states(remote: Remote, host: str) -> dict[str, tuple[str, str]]:
+    """datanode hostname -> (operational state, health state), from `ozone admin datanode list`."""
+    return parse_datanode_states(remote.run(host, _DN_LIST, KRB5CC, timeout=180))
+
+
+def parse_datanode_states(out: str) -> dict[str, tuple[str, str]]:
+    return {m.group(1): (m.group(2), m.group(3) or "?") for m in _DN_BLOCK.finditer(out)}
+
+
+def decommission_datanode(remote: Remote, host: str, datanode: str) -> None:
+    """Starts decommissioning `datanode` (its containers are re-replicated first); raises RemoteError if refused."""
+    remote.run(host, _DN_DECOMMISSION, KRB5CC, datanode, timeout=180)

@@ -2,9 +2,10 @@
 
 Discovery only checks what is available (jcmd next to each JVM's java; async-profiler under /opt on each host). The
 question comes after the Freon settings; async-profiler is installed, where missing, right before Freon starts.
-Recording starts with run 1 and lasts the asked period (default 10 min); runs that end sooner stop it. Every
-profiler command runs as the JVM's own user, the only user that can attach to it. After the last run each
-recording is copied to <run folder>/profiler/<profiler>/ and, once its size matches, deleted from the host.
+Each Freon run is recorded on its own: recording starts right before the run and stops when it ends (the asked period,
+default 30 min, is only a safety limit). Every profiler command runs as the JVM's own user, the only user that can
+attach to it. After each run its recordings are copied to <run folder>/profiler/<profiler>/<run>/<service>-<host>.jfr
+and, once the size matches, deleted from the host.
 """
 
 from __future__ import annotations
@@ -17,18 +18,21 @@ from dataclasses import dataclass, field
 
 from . import duration
 from .discover import Discovered
-from .freon import REMOTE_BASE
+from .freon import FREON_RECORDING, REMOTE_BASE
 from .options import Args
 from .prompts import Abort, Invalid, Ok, Option, Prompter
 from .remote import RemoteError, parallel, short
 
 NONE, JFR, ASYNC = "none", "jfr", "async-profiler"
 DEFAULT_SERVICES = "om,scm,dn"
-DEFAULT_PERIOD = "10m"
+DEFAULT_ASYNC_SERVICES = "om,scm,dn,freon"
+FREON = "freon"  # the Freon client JVM; async-profiler only
+DEFAULT_PERIOD = "30m"  # per-run safety limit: each recording stops when its run ends
 JFR_SETTINGS = "profile"  # the JDK's low-overhead profiling template
 ASPROF_VERSION = "4.6"
 ASPROF_HOME = f"/opt/async-profiler-{ASPROF_VERSION}"
 ASPROF = f"{ASPROF_HOME}/bin/asprof"
+ASPROF_LIB = f"{ASPROF_HOME}/lib/libasyncProfiler.so"
 ASPROF_URL = (f"https://github.com/async-profiler/async-profiler/releases/download/v{ASPROF_VERSION}/"
               f"async-profiler-{ASPROF_VERSION}-linux-x64.tar.gz")
 DEFAULT_EVENTS = "cpu,alloc,lock,wall"
@@ -127,7 +131,7 @@ pid=$1 user=$2 asprof=$3 base=$4 name=$5
 status=$(as_user "$user" "$asprof" status "$pid" 2>&1)
 [[ $status =~ running\ for\ ([0-9]+)\ seconds ]] || exit 0
 running=${BASH_REMATCH[1]} left=- old=-
-for f in "$base"/*/profiler/"$name".pid; do
+for f in "$base"/*/profiler/"$name".pid "$base"/*/profiler/*/"$name".pid; do
   launcher=$(cat "$f" 2> /dev/null) && kill -0 "$launcher" 2> /dev/null || continue
   old=${f%.pid}
   period=$(ps -eo pgid=,args= | awk -v g="$launcher" '$1 == g' | grep -oE -- ' -d [0-9]+' | head -1 | tr -dc 0-9)
@@ -186,10 +190,16 @@ class Target:
     user: str
     jcmd: str | None
     remote_file: str
+    run: str = ""  # the Freon run this recording covers (run-1, ...); set by for_run
 
     @property
     def file_name(self) -> str:
         return f"{self.service}-{short(self.host)}.jfr"
+
+    def for_run(self, run: str) -> Target:
+        """The same JVM, recorded into <profiler folder>/<run>/ on its host."""
+        folder = self.remote_file.rsplit("/", 1)[0]
+        return dataclasses.replace(self, run=run, remote_file=f"{folder}/{run}/{self.file_name}")
 
 
 @dataclass(frozen=True)
@@ -223,10 +233,19 @@ class ProfilePlan:
     answers: dict[str, object] = field(default_factory=dict)
     leftovers: tuple[Leftover, ...] = ()  # recordings already running on the targets when asked
     on_leftovers: str = RESTART          # RESTART or WAIT
+    freon: bool = False                  # async-profiler also on the Freon client JVM of every measured run
 
     @property
     def settings(self) -> str:
         return f"settings={JFR_SETTINGS}" if self.profiler == JFR else f"async-profiler {ASPROF_VERSION} {self.events}"
+
+    def freon_jvm_opts(self) -> str:
+        """The Freon JVM is short-lived, so async-profiler is loaded as an agent at its start and writes the recording
+        when it exits; '{dir}' is the run's folder on the Freon host. Same events and per-thread split as the
+        services. Empty when the Freon client isn't profiled."""
+        if not self.freon:
+            return ""
+        return f"-agentpath:{ASPROF_LIB}=start,event={self.events},threads,file={{dir}}/{FREON_RECORDING}"
 
 
 @dataclass(frozen=True)
@@ -274,16 +293,20 @@ def ask(p: Prompter, args: Args, d: Discovered, avail: Availability) -> ProfileP
     ], preset=args.profiler, flag="--profiler")
     if profiler == NONE:
         return None
-    targets = p.ask("Services to record (om, scm, dn, recon, s3g)", _services(_targets(d, profiler)),
-                    default=DEFAULT_SERVICES, preset=args.profile_services, flag="--profile-services")
-    period = p.ask("Recording period (e.g. 10m, 600s)", _period, default=DEFAULT_PERIOD, preset=args.profile_period,
-                   flag="--profile-period")
+    with_freon = profiler == ASYNC  # the Freon client is only profiled with async-profiler (as an agent)
+    default_services = DEFAULT_ASYNC_SERVICES if with_freon else DEFAULT_SERVICES
+    targets, freon_client = p.ask(f"Services to record (om, scm, dn, recon, s3g{', freon' if with_freon else ''})",
+                                  _services(_targets(d, profiler), with_freon), default=default_services,
+                                  preset=args.profile_services, flag="--profile-services")
+    period = p.ask("Recording limit per run (each recording stops when its run ends; e.g. 30m)", _period,
+                   default=DEFAULT_PERIOD, preset=args.profile_period, flag="--profile-period")
     p.warn(f"{profiler} costs a few % of CPU: compare these runs only with other {profiler} runs")
-    services = ",".join(dict.fromkeys(t.service for t in targets))
-    answers = {"profiler": profiler, "profile_services": None if services == DEFAULT_SERVICES else services,
+    services = ",".join([*dict.fromkeys(t.service for t in targets), *([FREON] if freon_client else [])])
+    answers = {"profiler": profiler, "profile_services": None if services == default_services else services,
                "profile_period": None if period == duration.parse(DEFAULT_PERIOD) else duration.format(period),
                "asprof_events": None if profiler != ASYNC or events == DEFAULT_EVENTS else events}
-    plan = ProfilePlan(profiler, tuple(targets), period, events, f"opp-{d.run_dir.name}", answers)
+    plan = ProfilePlan(profiler, tuple(targets), period, events, f"opp-{d.run_dir.name}", answers,
+                       freon=freon_client)
     return _ask_leftovers(p, d, plan)
 
 
@@ -324,8 +347,8 @@ def find_leftovers(d: Discovered, plan: ProfilePlan) -> list[Leftover]:
     return [lo for lo in parallel(check, plan.targets).values() if isinstance(lo, Leftover)]
 
 
-def _settle_leftovers(p: Prompter, d: Discovered, plan: ProfilePlan) -> None:
-    """Carries out the answer to the leftover question right before the new recordings start."""
+def settle_leftovers(p: Prompter, d: Discovered, plan: ProfilePlan) -> None:
+    """Carries out the answer to the leftover question, once, before the first run's recordings start."""
     if not plan.leftovers:
         return
     if plan.on_leftovers == WAIT:
@@ -366,23 +389,26 @@ def _targets(d: Discovered, profiler: str) -> list[Target]:
             if r.name in jvms and (profiler != JFR or jvms[r.name].jcmd)]
 
 
-def _services(available: list[Target]) -> Callable[[str], Ok[list[Target]]]:
-    def check(raw: str) -> Ok[list[Target]]:
+def _services(available: list[Target], with_freon: bool) -> Callable[[str], Ok[tuple[list[Target], bool]]]:
+    """(service JVMs to record, whether to record the Freon client too)."""
+    def check(raw: str) -> Ok[tuple[list[Target], bool]]:
         wanted = [s.strip().lower() for s in raw.split(",") if s.strip()]
-        known = sorted({t.service for t in available})
+        known = sorted({t.service for t in available}) + ([FREON] if with_freon else [])
         unknown = [s for s in wanted if s not in known]
         if not wanted or unknown:
             raise Invalid(f"{'unknown: ' + ', '.join(unknown) + '; ' if unknown else ''}"
                           f"choose from {', '.join(known)}")
         chosen = [t for t in available if t.service in wanted]
-        counts = ", ".join(f"{sum(t.service == s for t in chosen)} {s}" for s in dict.fromkeys(wanted))
-        return Ok(chosen, f"{len(chosen)} JVMs to record: {counts}")
+        counts = [f"{sum(t.service == s for t in chosen)} {s}" for s in dict.fromkeys(wanted) if s != FREON]
+        freon = FREON in wanted
+        what = ", ".join(counts + (["the Freon client of each run"] if freon else []))
+        return Ok((chosen, freon), f"to record: {what}")
     return check
 
 
 def _period(raw: str) -> Ok[int]:
-    seconds = duration.check("recording period", minimum=30)(raw).value
-    return Ok(seconds, f"{duration.format(seconds)} from the start of run 1")
+    seconds = duration.check("recording limit", minimum=30)(raw).value
+    return Ok(seconds, f"each run recorded from its start to its end, at most {duration.format(seconds)}")
 
 
 # --- before Freon: install ----------------------------------------------------------------------------------------
@@ -391,7 +417,7 @@ def install(p: Prompter, d: Discovered, plan: ProfilePlan, avail: Availability) 
     """async-profiler only: installs it on the chosen hosts that lack it; any failure stops the run."""
     if plan.profiler != ASYNC:
         return
-    hosts = sorted({t.host for t in plan.targets})
+    hosts = sorted({t.host for t in plan.targets} | ({d.discovery.freon_host} if plan.freon else set()))
     needed = [h for h in hosts if h not in avail.asprof_hosts]
     if not needed:
         p.ok(f"async-profiler {ASPROF_VERSION} already installed on all {len(hosts)} hosts")
@@ -409,9 +435,11 @@ def install(p: Prompter, d: Discovered, plan: ProfilePlan, avail: Availability) 
 
 # --- during the runs ----------------------------------------------------------------------------------------------
 
-def start(p: Prompter, d: Discovered, plan: ProfilePlan) -> list[Target]:
-    """Starts every recording; returns the JVMs that are recording."""
-    _settle_leftovers(p, d, plan)
+def start(p: Prompter, d: Discovered, plan: ProfilePlan, run: str) -> list[Target]:
+    """Starts one recording per JVM for this Freon run, right before Freon starts; finish() stops it when the run
+    ends. The period is only a safety limit, in case opp dies mid-run. Returns the JVMs that are recording."""
+    if not plan.targets:  # only the Freon client: its agent starts with each run
+        return []
 
     def begin(t: Target) -> str:
         if plan.profiler == JFR:
@@ -421,17 +449,16 @@ def start(p: Prompter, d: Discovered, plan: ProfilePlan) -> list[Target]:
                             timeout=60)
 
     started = []
-    for t, out in parallel(begin, plan.targets).items():
+    for t, out in parallel(begin, [t.for_run(run) for t in plan.targets]).items():
         if not isinstance(out, Exception) and _started(plan.profiler, out):
             started.append(t)
         else:
             p.warn(f"{plan.profiler} did not start on {t.service}@{short(t.host)}: {str(out).strip()[-300:]}")
     if not started:
-        p.fail(f"{plan.profiler} did not start on any JVM; the Freon runs go ahead without it")
+        p.fail(f"{plan.profiler} did not start on any JVM; {run} goes ahead without it")
         return started
-    until = time.strftime("%H:%M:%S", time.localtime(time.time() + plan.period_s))
-    p.ok(f"{plan.profiler} recording on {len(started)}/{len(plan.targets)} JVMs for "
-         f"{duration.format(plan.period_s)} (until {until} local)")
+    p.ok(f"{plan.profiler} recording {run} on {len(started)}/{len(plan.targets)} JVMs "
+         f"(stops when the run ends; at most {duration.format(plan.period_s)})")
     return started
 
 
@@ -443,10 +470,11 @@ def _started(profiler: str, out: str) -> bool:
 
 
 def finish(p: Prompter, d: Discovered, plan: ProfilePlan, started: list[Target]) -> list[Recording]:
-    """Stops what is still recording, copies each recording to <run folder>/profiler/<profiler>/, then removes the
-    remote files."""
-    p.section("Collecting the profiler recordings")
-    folder = d.run_dir.path / "profiler" / plan.profiler
+    """Stops the run's recordings, copies each to <run folder>/profiler/<profiler>/<run>/<service>-<host>.jfr, then
+    removes the remote files."""
+    run = started[0].run if started else ""
+    p.say(f"  stopping and collecting the {plan.profiler} recordings of {run}")
+    folder = d.run_dir.path / "profiler" / plan.profiler / run
 
     def collect(t: Target) -> Recording:
         if plan.profiler == JFR:
@@ -470,14 +498,14 @@ def finish(p: Prompter, d: Discovered, plan: ProfilePlan, started: list[Target])
         else:
             recordings.append(result)
     copied = [r for r in recordings if r.local_file]
-    p.ok(f"copied {len(copied)}/{len(started)} recordings ({sum(r.size_bytes or 0 for r in copied) / 1e6:,.1f} MB) "
-         f"to {folder}")
-    d.run_dir.update_manifest("profiling", {"profiler": plan.profiler, "settings": plan.settings,
-                                            "period_s": plan.period_s, "recordings": recordings})
+    p.ok(f"copied {len(copied)}/{len(started)} recordings of {run} "
+         f"({sum(r.size_bytes or 0 for r in copied) / 1e6:,.1f} MB) to {folder}")
+    d.run_dir.update_manifest(f"profiling-{run}", {"profiler": plan.profiler, "settings": plan.settings,
+                                                   "limit_s": plan.period_s, "recordings": recordings})
     return recordings
 
 
-def interrupted_hint(plan: ProfilePlan) -> str:
-    folder = plan.targets[0].remote_file.rsplit("/", 1)[0]
+def interrupted_hint(plan: ProfilePlan, started: list[Target]) -> str:
+    folder = started[0].remote_file.rsplit("/", 1)[0]
     return (f"{plan.profiler} keeps recording for up to {duration.format(plan.period_s)}; "
             f"the files stay in {folder} on each host")

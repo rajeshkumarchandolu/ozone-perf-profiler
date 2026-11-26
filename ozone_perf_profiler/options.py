@@ -36,6 +36,10 @@ class Args:
     keytab_dir: str = _opt("folder on the Freon host whose *.keytab files are offered", "/cdep/keytabs")
     kerberos_keytab: str | None = _opt("keytab path on the Freon host (skips the keytab list)")
     kerberos_principal: str | None = _opt("principal in that keytab")
+    om_leader: str | None = _opt("make this OM host the Ratis leader before the runs (ozone admin om transfer); "
+                                 "the run stops if it can't (default: leave the leader as it is)")
+    scm_leader: str | None = _opt("make this SCM host the Ratis leader before the runs (ozone admin scm transfer); "
+                                  "the run stops if it can't (default: leave the leader as it is)")
     # Freon ockg
     threads: str | None = _opt("Freon threads (default 10)")
     keys: str | None = _opt("keys to write (default 100000)")
@@ -50,8 +54,11 @@ class Args:
     cleanup: bool = _opt("delete the Freon volume after the last run", False)
     # Profiling (one of JFR or async-profiler)
     profiler: str | None = _opt("profile the Ozone JVMs during the runs: none, jfr or async-profiler (otherwise asked)")
-    profile_services: str | None = _opt("services to profile, comma-separated: om,scm,dn,recon,s3g (default om,scm,dn)")
-    profile_period: str | None = _opt("recording period from the start of run 1, e.g. 10m, 600s (default 10m)")
+    profile_services: str | None = _opt("services to profile, comma-separated: om,scm,dn,recon,s3g, plus freon "
+                                        "for the Freon client with async-profiler (default om,scm,dn; "
+                                        "om,scm,dn,freon for async-profiler)")
+    profile_period: str | None = _opt("safety limit per run: each recording starts with its Freon run and stops "
+                                      "when it ends, e.g. 30m (default 30m)")
     asprof_events: str | None = _opt("async-profiler events, passed to asprof -e (default cpu,alloc,lock,wall)")
     # Telemetry (Prometheus)
     prometheus_url: str | None = _opt("the Ozone Prometheus (default: the OZONE_PROMETHEUS role in CM)")

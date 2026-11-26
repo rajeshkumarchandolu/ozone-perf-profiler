@@ -36,7 +36,7 @@ def profiling_summary(profile: ProfilePlan | None, recordings: list[Recording]) 
     if not profile:
         return "none"
     copied = sum(bool(r.local_file) for r in recordings)
-    return f"{profile.settings}, {profile.period_s}s: {copied}/{len(recordings)} recordings in profiler/{profile.profiler}/"
+    return f"{profile.settings}, {profile.period_s}s: {copied}/{len(recordings)} recordings in profiler/{profile.profiler}/run-N/"
 
 
 def _report(d: Discovered, plan: Plan, results: list[FreonResult], source: Source, values: list[Value],

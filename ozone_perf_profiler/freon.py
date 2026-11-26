@@ -30,16 +30,17 @@ _SIZE = re.compile(r"(\d+)\s*([KMG]?)B?", re.IGNORECASE)
 _SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
 _OZONE_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 
-# Args: <dir> <tmux session> <krb5 ccache or ''> <freon args...>. Prints "<launcher> <pid>".
+# Args: <dir> <tmux session> <krb5 ccache or ''> <extra JVM options or ''> <freon args...>. Prints "<launcher> <pid>".
 # Detached in a tmux session when tmux is installed (attach to watch it live), else with setsid. Either way it
-# outlives the ssh connection. The wrapper sets its own dir and KRB5CCNAME: a tmux server that is already
-# running does not pass on the environment of the ssh command that starts the session.
+# outlives the ssh connection. The wrapper sets its own dir, KRB5CCNAME and OZONE_OPTS (e.g. the async-profiler
+# agent): a tmux server that is already running does not pass on the environment of the ssh command that starts it.
 _START = r'''
 set -u
 dir=$1 session=$2; shift 2
 mkdir -p "$dir" && cd "$dir" || exit 3
 [[ ! -e pid ]] || { echo "$dir already holds a run" >&2; exit 3; }
-run='cd "$0" || exit 3; [[ -z $1 ]] || export KRB5CCNAME=$1; shift; echo $$ > pid; date +%s > start; '\
+run='cd "$0" || exit 3; [[ -z $1 ]] || export KRB5CCNAME=$1; [[ -z $2 ]] || export OZONE_OPTS="${OZONE_OPTS:-} $2"; '\
+'shift 2; echo $$ > pid; date +%s > start; '\
 'ozone freon "$@" 2>&1 | tee freon.log; echo "${PIPESTATUS[0]}" > exit; date +%s > end'
 if command -v tmux > /dev/null; then
   tmux new-session -d -s "$session" "$(printf '%q ' bash -c "$run" "$dir" "$@")" || exit 3
@@ -256,8 +257,9 @@ def ask(p: Prompter, args: Args, d: Discovered) -> Plan:
     return plan
 
 
-def execute(p: Prompter, d: Discovered, plan: Plan, index: int) -> FreonRun:
-    """Runs one Freon of the series (index 0: the warm-up) and copies its log to freon/<run name>/."""
+def execute(p: Prompter, d: Discovered, plan: Plan, index: int, jvm_opts: str = "") -> FreonRun:
+    """Runs one Freon of the series (index 0: the warm-up) and copies its log to freon/<run name>/.
+    jvm_opts is added to the Freon JVM's OZONE_OPTS, e.g. the async-profiler agent (empty for the warm-up)."""
     spec, host, name = plan.spec_for(index), d.discovery.freon_host, run_name(index)
     p.section(f"Freon warm-up, {spec.keys} keys (not reported)" if index == 0
               else f"Freon run {index}/{plan.runs}")
@@ -271,7 +273,8 @@ def execute(p: Prompter, d: Discovered, plan: Plan, index: int) -> FreonRun:
     # region agent log
     hostcpu = _hostcpu_start(d, name)
     # endregion
-    out = _remote(lambda: remote.run(host, _START, remote_dir, session, ccache, *spec.argv()),
+    jvm_opts = jvm_opts.replace("{dir}", remote_dir)
+    out = _remote(lambda: remote.run(host, _START, remote_dir, session, ccache, jvm_opts, *spec.argv()),
                   "starting Freon")
     launch = Launch.parse(out, session)
     target = f"{remote.user}@{host}"
@@ -303,7 +306,24 @@ def execute(p: Prompter, d: Discovered, plan: Plan, index: int) -> FreonRun:
     # endregion
     p.ok(f"Freon {'warm-up' if index == 0 else f'run {index}'} completed in {result.duration_s}s, "
          f"{_describe_exit(state)}")
+    if FREON_RECORDING in jvm_opts:
+        _collect_recording(p, d, host, remote_dir, name)
     return result
+
+
+FREON_RECORDING = "freon.jfr"  # written by the async-profiler agent in the run's folder on the Freon host
+
+
+def _collect_recording(p: Prompter, d: Discovered, host: str, remote_dir: str, name: str) -> None:
+    """Copies the Freon JVM's async-profiler recording to <run folder>/profiler/async-profiler/<run>/freon-<host>.jfr,
+    next to the server recordings of the same run."""
+    local = d.run_dir.path / "profiler" / "async-profiler" / name / f"freon-{short(host)}.jfr"
+    try:
+        d.remote.fetch(host, f"{remote_dir}/{FREON_RECORDING}", local)
+    except RemoteError as e:
+        p.warn(f"no Freon recording copied for {name}: {e}")
+        return
+    p.ok(f"copied the Freon client's recording to {local} ({local.stat().st_size / 1e6:,.1f} MB)")
 
 
 def wait_grace(p: Prompter, plan: Plan, next_index: int) -> None:

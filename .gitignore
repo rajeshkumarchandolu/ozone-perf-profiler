@@ -25,3 +25,6 @@ venv/
 /analyze-overhead/
 /analyze-overhead.zip
 /.cursor/
+
+# Local MCP config (contains tokens)
+.mcp.json

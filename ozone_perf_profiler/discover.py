@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,14 @@ def run(p: Prompter, args: Args) -> Discovered:
         freon_host, version = _pick_freon_host(p, args, remote, topo)
         security = _security(p, remote, freon_host)
         kerberos = _kerberos(p, args, remote, freon_host) if security.kerberos else None
+        if args.om_leader:
+            _pin_leader(p, "OM", "--om-leader", args.om_leader, topo.of_type("OZONE_MANAGER"),
+                        lambda: probes.om_roles(remote, freon_host, security.om_service_id),
+                        lambda node: probes.om_transfer(remote, freon_host, security.om_service_id, node))
+        if args.scm_leader:
+            _pin_leader(p, "SCM", "--scm-leader", args.scm_leader, topo.of_type("STORAGE_CONTAINER_MANAGER"),
+                        lambda: probes.scm_roles(remote, freon_host),
+                        lambda node: probes.scm_transfer(remote, freon_host, node))
         om_leader = _leader(p, "OM", topo.of_type("OZONE_MANAGER"),
                             lambda: probes.om_leader(remote, freon_host, security.om_service_id))
         scm_leader = _leader(p, "SCM", topo.of_type("STORAGE_CONTAINER_MANAGER"),
@@ -304,6 +313,37 @@ def _leader(p: Prompter, label: str, roles: list, ask_cluster: Callable[[], str 
     return leader
 
 
+PIN_ATTEMPTS = 3   # leadership transfers before giving up
+PIN_WAIT_S = 20    # after each transfer, before checking again
+
+
+def _pin_leader(p: Prompter, label: str, flag: str, want: str, servers: list,
+                roles: Callable[[], list[tuple[str, str, str]]], transfer: Callable[[str], None]) -> None:
+    """Makes the OM or SCM on host `want` the Ratis leader and checks that it is. roles() lists (node id, role, host)
+    of every server; transfer(node id) hands leadership over (ozone admin om|scm transfer).
+    Raises Abort when it isn't the leader after PIN_ATTEMPTS transfers: runs with another leader wouldn't compare."""
+    target = next((r.host for r in servers if short(r.host) == short(want)), None)
+    if target is None:
+        raise Abort(f"{flag} {want}: no {label} there ({label}s: {', '.join(short(r.host) for r in servers)})")
+    for attempt in range(PIN_ATTEMPTS + 1):
+        try:
+            listed = roles()
+            node = next((n for n, _, h in listed if short(h) == short(target)), None)
+            if node is None:
+                raise Abort(f"{flag} {want}: 'ozone admin {label.lower()} roles' does not list it: {listed}")
+            if any(role == "LEADER" and short(h) == short(target) for _, role, h in listed):
+                p.ok(f"{label} leader pinned to {short(target)} ({node})")
+                return
+            if attempt == PIN_ATTEMPTS:
+                break
+            p.say(f"  transferring {label} leadership to {short(target)} ({node}), try {attempt + 1}/{PIN_ATTEMPTS}")
+            transfer(node)
+        except RemoteError as e:
+            p.warn(f"{label} leadership transfer to {short(target)}: {e}")
+        time.sleep(PIN_WAIT_S)
+    raise Abort(f"{flag} {want}: still not the {label} leader after {PIN_ATTEMPTS} transfers")
+
+
 # --- output -------------------------------------------------------------------------------------------------------
 
 def _print_layout(p: Prompter, d: Discovery) -> None:
@@ -353,6 +393,8 @@ def _save(p: Prompter, args: Args, name: str, d: Discovery, client: CmClient, tl
         "ssh_user": ssh_user, "freon_host": d.freon_host,
         "kerberos_keytab": d.kerberos.keytab if d.kerberos else None,
         "kerberos_principal": d.kerberos.principal if d.kerberos else None,
+        "om_leader": args.om_leader,
+        "scm_leader": args.scm_leader,
     }
     run_dir.update_manifest("discover", answers)
     p.ok(f"saved {run_dir.path}/cluster.json")

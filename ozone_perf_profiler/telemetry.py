@@ -36,6 +36,11 @@ class Metric:
     query: str  # PromQL with $window; must give one value per series
 
 
+# Ozone's HA, Ratis and safe-mode metrics have no processname label; this copies it from the JVM metrics of the same
+# endpoint (instance), so their rows sit under OM / SCM / DN like the rest.
+_WITH_PROCESS = " * on(instance) group_left(processname) (0 * max by (instance, processname) (jvm_metrics_mem_heap_used_m) + 1)"
+LEADER_SHARE = "Ratis leader, share of run (1 = leader all run)"
+
 CATALOG = (
     # memory, MB
     Metric("heap used MB, avg", "avg_over_time(jvm_metrics_mem_heap_used_m[$window])"),
@@ -72,6 +77,18 @@ CATALOG = (
     Metric("W3C context extract total ms",
            "sum(increase(tracing_util_w3c_trace_context_extract_time_num_ops[$window])"
            " * avg_over_time(tracing_util_w3c_trace_context_extract_time_avg_time[$window])) / 1e6"),
+    # cluster state during the run: who led, did leadership move, was SCM in safe mode
+    Metric(LEADER_SHARE, "max by (instance) (avg_over_time(omha_metrics_ozone_manager_ha_leader_state[$window])"
+                         " or avg_over_time(scmha_metrics_scmha_leader_state[$window]))" + _WITH_PROCESS),
+    Metric("Ratis leader elections", "sum by (instance) (increase(ratis_leader_election_electionCount[$window]))"
+                                     + _WITH_PROCESS),
+    Metric("Ratis leadership transfers",
+           "sum by (instance) (increase(ratis_leader_election_transferLeadershipCount[$window]))" + _WITH_PROCESS),
+    Metric("not-leader exceptions (client retries)",
+           "sum by (instance) (increase(rpcdetailed_om_not_leader_exception_num_ops[$window])"
+           " or increase(rpcdetailed_server_not_leader_exception_num_ops[$window]))" + _WITH_PROCESS),
+    Metric("SCM in safe mode, share of run", "avg_over_time(safe_mode_metrics_scm_in_safe_mode[$window])"
+                                             + _WITH_PROCESS),
 )
 
 
@@ -208,6 +225,7 @@ def collect(p: Prompter, d: Discovered, source: Source, results: list[FreonResul
     d.run_dir.write_json("metrics/metrics.json", [asdict(v) for v in values])
     metrics = [m.name for m in source.metrics if m.name not in dropped]
     _print(p, by_node(values, metrics, d.discovery.leaders), [r.run for r in results])
+    _warn_on_leader_changes(p, values)
     p.ok(f"saved {d.run_dir.path}/metrics/metrics.json")
     return values
 
@@ -223,6 +241,13 @@ def _prom_now(source: Source) -> float:
         return source.client.now()
     except PromError:
         return time.time()
+
+
+def _warn_on_leader_changes(p: Prompter, values: list[Value]) -> None:
+    """A leader share strictly between 0 and 1 means the OM or SCM leadership moved during that run."""
+    for v in values:
+        if v.metric == LEADER_SHARE and 0.01 < v.value < 0.99:
+            p.warn(f"{v.run}: leadership changed during the run on {v.series} (leader {v.value:.0%} of the run)")
 
 
 def series_name(s: Sample) -> str:

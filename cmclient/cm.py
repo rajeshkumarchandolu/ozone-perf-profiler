@@ -140,11 +140,51 @@ class CmClient:
         items = self._get_json(f"{self._service_path(cluster, service)}/config?view=full", "service-config")["items"]
         return {i["name"]: CmParam(i["name"], i.get("value"), i.get("default")) for i in items}
 
+    def role_config_groups(self, cluster: CmCluster, service: CmService) -> list[dict[str, Any]]:
+        """Each group has 'name' and 'roleType' (e.g. OZONE_MANAGER); a role type can have several groups."""
+        return self._get_json(f"{self._service_path(cluster, service)}/roleConfigGroups", "role-config-groups")["items"]
+
+    def role_group_config(self, cluster: CmCluster, service: CmService, group: str) -> dict[str, CmParam]:
+        """Parameters of one role config group by name, with the value set in CM and the default."""
+        path = f"{self._service_path(cluster, service)}/roleConfigGroups/{_q(group)}/config?view=full"
+        items = self._get_json(path, f"role-group-config-{group}")["items"]
+        return {i["name"]: CmParam(i["name"], i.get("value"), i.get("default")) for i in items}
+
     # --- writes (use cases only) ---
 
     def update_service_config(self, cluster: CmCluster, service: CmService, values: dict[str, str]) -> None:
         body = {"items": [{"name": k, "value": v} for k, v in values.items()]}
         self._call("PUT", f"{self._service_path(cluster, service)}/config", body)
+
+    def update_role_group_config(self, cluster: CmCluster, service: CmService, group: str,
+                                 values: dict[str, str]) -> None:
+        body = {"items": [{"name": k, "value": v} for k, v in values.items()]}
+        self._call("PUT", f"{self._service_path(cluster, service)}/roleConfigGroups/{_q(group)}/config", body)
+
+    def stop_roles(self, cluster: CmCluster, service: CmService, role_type: str, host: str | None = None,
+                   timeout_s: float = 600, say: Callable[[str], None] = print) -> list[str]:
+        """Stops every role of role_type (e.g. OZONE_RECON), or only the one on `host`, that isn't stopped yet and
+        waits until CM reports it STOPPED. Returns the names it stopped; [] when they all already were."""
+        roles = [r for r in self.roles(cluster, service) if r["type"] == role_type]
+        if host:
+            names_by_id = self.hostnames()
+            roles = [r for r in roles if names_by_id.get(r.get("hostRef", {}).get("hostId", ""), "").split(".")[0]
+                     == host.split(".")[0]]
+        if not roles:
+            raise CmError(f"no {role_type} role{' on ' + host if host else ''} in {service.name}")
+        names = [r["name"] for r in roles if r.get("roleState") != "STOPPED"]
+        if not names:
+            return []
+        say(f"stopping {', '.join(names)}")
+        answer = self._call("POST", f"{self._service_path(cluster, service)}/roleCommands/stop", {"items": names})
+        if answer.get("errors"):
+            raise CmError(f"stopping {', '.join(names)}: {'; '.join(answer['errors'])}")
+        for cmd in answer.get("items", []):
+            self.wait_for_command(int(cmd["id"]), timeout_s)
+        if running := [r["name"] for r in self.roles(cluster, service)
+                       if r["name"] in names and r.get("roleState") != "STOPPED"]:
+            raise CmError(f"still not STOPPED after the stop command: {', '.join(running)}")
+        return names
 
     def service_command(self, cluster: CmCluster, service: CmService, command: str) -> int:
         """Starts a service command (restart, deployClientConfig, ...) and returns its command id."""
@@ -168,24 +208,58 @@ class CmClient:
                              timeout_s: float = 1800, say: Callable[[str], None] = print) -> bool:
         """Sets the values, restarts the service, redeploys client configs and waits until every role runs, isn't
         BAD and is FRESH: CM's own proof that every process (and every gateway's client config) has the new values.
+        A key 'ROLE_TYPE:param' (e.g. 'OZONE_MANAGER:om_max_heap_size') is set on every role config group of that
+        role type; any other key is a service-level parameter.
         Skips the restart only when CM already has the values and no role is stale. Returns True if it restarted."""
+        service_values = {k: v for k, v in values.items() if ":" not in k}
+        role_values: dict[str, dict[str, str]] = {}
+        for key, v in values.items():
+            if ":" in key:
+                role_type, param = key.split(":", 1)
+                role_values.setdefault(role_type, {})[param] = v
         current = self.service_config(cluster, service)
-        if unknown := [k for k in values if k not in current]:
+        if unknown := [k for k in service_values if k not in current]:
             raise CmError(f"not parameters of {service.name}: {', '.join(unknown)}")
-        changes = {k: v for k, v in values.items() if not _same(current[k].effective, v)}
+        changes = {k: v for k, v in service_values.items() if not _same(current[k].effective, v)}
+        group_changes = self._role_group_changes(cluster, service, role_values)
         stale = [r["name"] for r in self.roles(cluster, service) if r.get("configStalenessStatus") != "FRESH"]
-        if not changes and not stale:
+        if not changes and not group_changes and not stale:
             say(f"CM already has {values} and every role is FRESH: no restart")
             return False
-        if changes:
-            say(f"setting {changes}, then restarting {service.name}")
-            self.update_service_config(cluster, service, changes)
+        if changes or group_changes:
+            if changes:
+                say(f"setting {changes}")
+                self.update_service_config(cluster, service, changes)
+            for group, group_values in group_changes.items():
+                say(f"setting {group}: {group_values}")
+                self.update_role_group_config(cluster, service, group, group_values)
+            say(f"restarting {service.name}")
         else:
             say(f"CM already has {values}, but {len(stale)} role(s) are stale: restarting {service.name}")
         self.wait_for_command(self.service_command(cluster, service, "restart"), timeout_s)
         self.wait_for_command(self.service_command(cluster, service, "deployClientConfig"), timeout_s)
         self.wait_for_roles(cluster, service, timeout_s, say)
         return True
+
+    def _role_group_changes(self, cluster: CmCluster, service: CmService,
+                            role_values: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+        """group name -> the values of role_values that its group doesn't have yet. Raises for a role type with no
+        group in the service, or a parameter its groups don't have."""
+        if not role_values:
+            return {}
+        groups = self.role_config_groups(cluster, service)
+        if missing := [t for t in role_values if not any(g["roleType"] == t for g in groups)]:
+            raise CmError(f"no role config group of type {', '.join(missing)} in {service.name}")
+        changes: dict[str, dict[str, str]] = {}
+        for g in groups:
+            if (values := role_values.get(g["roleType"])) is None:
+                continue
+            current = self.role_group_config(cluster, service, g["name"])
+            if unknown := [k for k in values if k not in current]:
+                raise CmError(f"not parameters of {g['name']}: {', '.join(unknown)}")
+            if diff := {k: v for k, v in values.items() if not _same(current[k].effective, v)}:
+                changes[g["name"]] = diff
+        return changes
 
     def wait_for_roles(self, cluster: CmCluster, service: CmService, timeout_s: float,
                        say: Callable[[str], None] = print) -> None:

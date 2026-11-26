@@ -25,18 +25,23 @@ def run(args: Args) -> list[freon_output.FreonResult]:
             profiling.install(p, d, profile, available)
         if plan.warmup_keys and not freon_output.report(p, d.run_dir, freon.execute(p, d, plan, 0)).ok:
             raise Abort("the warm-up run failed, so the measured runs would too; see the freon.log lines above")
-        recording = profiling.start(p, d, profile) if profile else []  # from run 1 on, after the warm-up
-        results = []
-        try:
-            for index in range(1, plan.runs + 1):
-                if index > 1:
-                    freon.wait_grace(p, plan, index)
-                results.append(freon_output.report(p, d.run_dir, freon.execute(p, d, plan, index)))
-        except BaseException as e:
-            if recording:
-                _interrupted_profiling(p, d, profile, recording, interrupted=isinstance(e, KeyboardInterrupt))
-            raise
-        recordings = profiling.finish(p, d, profile, recording) if recording else []
+        if profile:
+            profiling.settle_leftovers(p, d, profile)  # recordings still running from an earlier run, asked about
+        freon_opts = profile.freon_jvm_opts() if profile else ""  # the Freon client, as an agent per run
+        results, recordings = [], []
+        for index in range(1, plan.runs + 1):
+            if index > 1:
+                freon.wait_grace(p, plan, index)
+            # each run is recorded on its own: started right before Freon, stopped right after it ends
+            recording = profiling.start(p, d, profile, freon.run_name(index)) if profile else []
+            try:
+                run = freon.execute(p, d, plan, index, freon_opts)
+            except BaseException as e:
+                if recording:
+                    _interrupted_profiling(p, d, profile, recording, interrupted=isinstance(e, KeyboardInterrupt))
+                raise
+            recordings += profiling.finish(p, d, profile, recording) if recording else []
+            results.append(freon_output.report(p, d.run_dir, run))
         freon.cleanup(p, d, plan)
     freon_output.series(p, d.run_dir, results)
     values = telemetry.collect(p, d, source, results)
@@ -53,4 +58,4 @@ def _interrupted_profiling(p: Prompter, d: discover.Discovered, profile: profili
     if interrupted and p.interactive and p.confirm(question, default=True):
         profiling.finish(p, d, profile, recording)  # a second Ctrl-C here quits right away
     else:
-        p.warn(profiling.interrupted_hint(profile))
+        p.warn(profiling.interrupted_hint(profile, recording))

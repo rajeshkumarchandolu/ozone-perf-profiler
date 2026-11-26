@@ -68,6 +68,19 @@ def setup_cluster(p: Prompter, cm: Cm, config: Config) -> None:
     p.ok(f"{cm.service.name}: every role STARTED and FRESH with {config.settings}")
 
 
+def stop_roles(p: Prompter, cm: Cm, role_types: list[str], host: str | None = None) -> None:
+    """Stops every role of these types (e.g. OZONE_RECON), or only those on `host`, for the runs that follow.
+    A service restart starts them again, so this runs after every setup_cluster."""
+    where = f" on {host.split('.')[0]}" if host else ""
+    for role_type in role_types:
+        try:
+            names = cm.client.stop_roles(cm.cluster, cm.service, role_type, host=host,
+                                         say=lambda m: p.say(f"  {m}"))
+        except CmError as e:
+            raise Abort(f"Cloudera Manager: {e}") from None
+        p.ok(f"{role_type}{where} stopped: {', '.join(names)}" if names else f"{role_type}{where} already stopped")
+
+
 def pause(p: Prompter, seconds: int, reason: str) -> None:
     if seconds <= 0:
         return
